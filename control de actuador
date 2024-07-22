@@ -1,0 +1,156 @@
+import time
+import Adafruit_PCA9685 # type: ignore
+import serial
+from simple_pid import PID
+from flask import Flask, request, jsonify
+import requests
+
+
+VISION_SYSTEM_URL = 'http://localhost:30000'  # Cambia la URL según sea necesario
+
+class ActuatorControl:
+    def __init__(self):
+        # Configuración inicial
+        self.servo_channel = 0
+        self.servo_min = 150
+        self.servo_max = 600
+        self.pwm = Adafruit_PCA9685.PCA9685()
+        self.pwm.set_pwm_freq(50)
+        self.serial_port = serial.Serial('COM1', 9600, timeout=1)  # Cambia 'COM1' a tu puerto serial
+        self.pid = PID(1, 0.1, 0.05, setpoint=90)
+    
+    def set_servo_pulse(self, channel, pulse):
+        """Configura el pulso del servomotor en el canal especificado."""
+        pulse_length = 1000000.0 / 60 / 4096
+        pulse *= 1000
+        pulse /= pulse_length
+        self.pwm.set_pwm(channel, 0, int(pulse))
+    
+    def calculate_servo_position(self, angle):
+        """Convierte el ángulo en una posición de pulso para el servomotor."""
+        pulse_range = self.servo_max - self.servo_min
+        return self.servo_min + (angle / 180.0) * pulse_range
+    
+    def move_actuator(self, angle):
+        """Mueve el actuador a un ángulo específico."""
+        pulse = self.calculate_servo_position(angle)
+        self.set_servo_pulse(self.servo_channel, pulse)
+        time.sleep(1)
+    
+    def move_actuator_incremental(self, start_angle, end_angle, increment):
+        """Mueve el actuador en incrementos de ángulo."""
+        for angle in range(start_angle, end_angle + 1, increment):
+            self.move_actuator(angle)
+    
+    def send_command_serial(self, command):
+        """Envía un comando al actuador a través del puerto serial."""
+        self.serial_port.write(command.encode())
+    
+    def calibrate_actuator(self, start_angle, end_angle):
+        """Calibra el actuador moviéndolo a un rango de ángulos."""
+        self.move_actuator(start_angle)
+        self.move_actuator(end_angle)
+    
+    def detect_obstacles(self):
+        """Detecta obstáculos que puedan interferir con el actuador."""
+        # Implementa tu lógica para detectar obstáculos
+        return False  # Simulación, cambiar según el sensor utilizado
+    
+    def move_safely(self, angle):
+        """Mueve el actuador de forma segura, considerando posibles obstáculos."""
+        if not self.detect_obstacles():
+            self.move_actuator(angle)
+    
+    def optimize_speed(self, angle, speed):
+        """Optimiza la velocidad del movimiento del actuador."""
+        pulse = self.calculate_servo_position(angle)
+        self.set_servo_pulse(self.servo_channel, pulse)
+        time.sleep(speed)
+    
+    def log_movement(self, start_angle, end_angle):
+        """Registra el movimiento del actuador en un archivo de log."""
+        with open('actuator_log.txt', 'a') as f:
+            f.write(f'Movimiento de {start_angle} a {end_angle} en {time.ctime()}\n')
+    
+    def move_servo_smoothly(self, start_angle, end_angle, movement_speed):
+        """Mueve el servomotor suavemente entre dos ángulos y registra el movimiento."""
+        start_pulse = self.calculate_servo_position(start_angle)
+        end_pulse = self.calculate_servo_position(end_angle)
+        steps = abs(end_angle - start_angle) // 1
+        for step in range(steps + 1):
+            angle = start_angle + step * (end_angle - start_angle) / steps
+            pulse = self.calculate_servo_position(angle)
+            self.set_servo_pulse(self.servo_channel, pulse)
+            self.log_movement(start_angle, angle)
+            time.sleep(movement_speed)
+    
+    def control_pid(self, target_angle):
+        """Controla el actuador usando un controlador PID para precisión."""
+        current_angle = 0  # Leer ángulo actual del actuador aquí
+        control = self.pid(current_angle)
+        self.move_actuator(control)
+
+# Configuración del servidor web
+app = Flask(__name__)
+actuator = ActuatorControl()
+
+@app.route('/receive_data', methods=['POST'])
+def receive_data():
+    try:
+        data = request.json
+        cable_status = data.get('cable_status')
+        if cable_status == 'dead':
+            actuator.move_servo_smoothly(0, 90, 0.1)
+            return jsonify({"status": "success", "message": "Actuador movido para cortar el cable muerto"}), 200
+        else:
+            return jsonify({"status": "success", "message": "No se requiere acción"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/send_command', methods=['POST'])
+def send_command():
+    try:
+        command = request.json.get('command')
+        response = requests.post(VISION_SYSTEM_URL, json={'command': command})
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+# Sistema de visión artificial
+app_vision = Flask(__name__)
+
+@app_vision.route('/detect', methods=['POST'])
+def detect():
+    try:
+        command = request.json.get('command')
+        cable_status = 'dead' if command == 'cut_cable' else 'alive'
+        return jsonify({"cable_status": cable_status}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    app_vision.run(host='0.0.0.0', port=5001, debug=True)
+
+# Pruebas y validación
+import unittest
+
+class TestActuatorControl(unittest.TestCase):
+    def setUp(self):
+        self.actuator = ActuatorControl()
+
+    def test_calculate_servo_position(self):
+        angle = 90
+        pulse = self.actuator.calculate_servo_position(angle)
+        self.assertEqual(pulse, 375)  # Ajusta según los valores esperados
+
+    def test_move_servo_smoothly(self):
+        try:
+            self.actuator.move_servo_smoothly(0, 90, 0.1)
+        except Exception as e:
+            self.fail(f'Error en move_servo_smoothly: {e}')
+
+if __name__ == '__main__':
+    unittest.main()
